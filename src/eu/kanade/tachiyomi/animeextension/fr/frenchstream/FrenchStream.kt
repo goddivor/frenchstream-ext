@@ -18,11 +18,13 @@ import eu.kanade.tachiyomi.lib.uqloadextractor.UqloadExtractor
 import eu.kanade.tachiyomi.lib.vidhideextractor.VidHideExtractor
 import eu.kanade.tachiyomi.lib.voeextractor.VoeExtractor
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.util.asJsoup
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.FormBody
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
@@ -78,20 +80,35 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     // =============================== Search ===============================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        return GET("$baseUrl/index.php?do=search&subaction=search&story=$query", headers)
+        val body = FormBody.Builder()
+            .add("query", query)
+            .add("page", page.toString())
+            .build()
+        val searchHeaders = headers.newBuilder()
+            .add("X-Requested-With", "XMLHttpRequest")
+            .add("Referer", "$baseUrl/")
+            .build()
+        return POST("$baseUrl/engine/ajax/search.php", searchHeaders, body)
     }
 
-    override fun searchAnimeSelector(): String = popularAnimeSelector()
+    override fun searchAnimeSelector(): String = "div.search-item"
 
-    override fun searchAnimeFromElement(element: Element): SAnime = popularAnimeFromElement(element)
+    override fun searchAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
+        val onclick = element.attr("onclick")
+        val href = Regex("location\\.href='([^']+)'").find(onclick)?.groupValues?.get(1).orEmpty()
+        if (href.isNotEmpty()) setUrlWithoutDomain(href)
+        title = element.selectFirst("div.search-title")?.text()?.trim()
+            ?: element.selectFirst("img")?.attr("alt").orEmpty()
+        thumbnail_url = element.selectFirst("img")?.absUrl("src")
+    }
 
-    override fun searchAnimeNextPageSelector(): String = popularAnimeNextPageSelector()
+    override fun searchAnimeNextPageSelector(): String? = null
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
         val animes = document.select(searchAnimeSelector()).map(::searchAnimeFromElement)
-        val hasNextPage = document.selectFirst(searchAnimeNextPageSelector()) != null
-        return AnimesPage(animes, hasNextPage)
+        // L'endpoint AJAX renvoie tous les résultats sur une seule page
+        return AnimesPage(animes, false)
     }
 
     // ============================== Filters ===============================
@@ -129,7 +146,6 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
         val epBody = epResponse.body.string()
 
         val epData = json.decodeFromString<JsonObject>(epBody)
-        val prefLang = preferences.getString(PREF_LANG_KEY, PREF_LANG_DEFAULT)!!
 
         // Check if it's a film (has "players" key) vs series (has "vf"/"vostfr" keys)
         if (epData.containsKey("players")) {
@@ -137,8 +153,11 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
             return parseFilmEpisodes(epData, id)
         }
 
+        val vfData = epData["vf"]?.jsonObject
+        val vostfrData = epData["vostfr"]?.jsonObject
+
         if (epBody.isBlank() || epBody == "{}" ||
-            (epData["vf"]?.jsonObject?.isEmpty() != false && epData["vostfr"]?.jsonObject?.isEmpty() != false)
+            (vfData?.isEmpty() != false && vostfrData?.isEmpty() != false)
         ) {
             // Try film API as fallback
             Log.d(TAG, "episodeListParse: ep-data empty, trying film_api")
@@ -153,55 +172,52 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
             Log.w(TAG, "episodeListParse: no data found")
             return emptyList()
         }
-        val episodes = mutableListOf<SEpisode>()
-
-        // Try preferred language first, fallback to other
-        val langData = epData[prefLang]?.jsonObject
-            ?: epData["vf"]?.jsonObject
-            ?: epData["vostfr"]?.jsonObject
 
         val infoData = epData["info"]?.jsonObject
 
-        if (langData == null || langData.isEmpty()) {
+        // Union de tous les numéros d'épisodes présents en VF et/ou VOSTFR
+        val allEpNums = ((vfData?.keys ?: emptySet()) + (vostfrData?.keys ?: emptySet()))
+            .distinct()
+            .sortedBy { it.toIntOrNull() ?: 0 }
+
+        if (allEpNums.isEmpty()) {
             Log.w(TAG, "episodeListParse: no episodes found in API")
             return emptyList()
         }
 
-        // Determine which languages are available
-        val hasVf = epData["vf"]?.jsonObject?.isNotEmpty() == true
-        val hasVostfr = epData["vostfr"]?.jsonObject?.isNotEmpty() == true
-        val langLabel = when {
-            hasVf && hasVostfr -> if (prefLang == "vf") "VF" else "VOSTFR"
-            hasVf -> "VF"
-            hasVostfr -> "VOSTFR"
-            else -> ""
-        }
-
-        langData.keys.sortedBy { it.toIntOrNull() ?: 0 }.forEach { epNum ->
+        val episodes = allEpNums.map { epNum ->
             val epInfo = infoData?.get(epNum)?.jsonObject
             val epTitle = epInfo?.get("title")?.jsonPrimitive?.content
 
-            // Encode player URLs directly in episode URL to avoid re-calling API
-            val players = langData[epNum]?.jsonObject
-            val playerUrls = players?.entries?.joinToString(";;;") { "${it.key}::${it.value.jsonPrimitive.content}" } ?: ""
+            val vfPlayers = vfData?.get(epNum)?.jsonObject
+            val vostfrPlayers = vostfrData?.get(epNum)?.jsonObject
 
-            episodes.add(
-                SEpisode.create().apply {
-                    val num = epNum.toIntOrNull() ?: 0
-                    episode_number = num.toFloat()
-                    name = if (epTitle != null) {
-                        "Épisode $epNum - $epTitle"
-                    } else {
-                        "Épisode $epNum"
-                    }
-                    scanlator = if (hasVf && hasVostfr) {
-                        "VF, VOSTFR"
-                    } else {
-                        langLabel
-                    }
-                    this.url = playerUrls
-                },
-            )
+            // Encode tous les players des deux langues avec un préfixe: "lang#server::url"
+            val encodedPlayers = buildList {
+                vfPlayers?.entries?.forEach {
+                    add("vf#${it.key}::${it.value.jsonPrimitive.content}")
+                }
+                vostfrPlayers?.entries?.forEach {
+                    add("vostfr#${it.key}::${it.value.jsonPrimitive.content}")
+                }
+            }.joinToString(";;;")
+
+            val langLabel = listOfNotNull(
+                "VF".takeIf { vfPlayers?.isNotEmpty() == true },
+                "VOSTFR".takeIf { vostfrPlayers?.isNotEmpty() == true },
+            ).joinToString(", ")
+
+            SEpisode.create().apply {
+                val num = epNum.toIntOrNull() ?: 0
+                episode_number = num.toFloat()
+                name = if (epTitle != null) {
+                    "Épisode $epNum - $epTitle"
+                } else {
+                    "Épisode $epNum"
+                }
+                scanlator = langLabel
+                this.url = encodedPlayers
+            }
         }
 
         Log.d(TAG, "episodeListParse: ${episodes.size} episodes found")
@@ -240,15 +256,47 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
 
     override suspend fun getVideoList(episode: SEpisode): List<Video> {
-        // Player URLs are encoded in episode.url as "server::url;;;server2::url2"
-        val playerEntries = episode.url.split(";;;").filter { it.contains("::") }
-        Log.d(TAG, "getVideoList: ${playerEntries.size} players")
+        val prefLang = preferences.getString(PREF_LANG_KEY, PREF_LANG_DEFAULT)!!
+
+        // Format series: "lang#server::url;;;lang#server::url"
+        // Format film : "server::url;;;server::url" (pas de préfixe de langue)
+        data class PlayerEntry(val lang: String?, val server: String, val url: String)
+
+        val allEntries = episode.url.split(";;;").filter { it.contains("::") }.map { entry ->
+            val (prefix, playerUrl) = entry.split("::", limit = 2)
+            if (prefix.contains("#")) {
+                val (lang, server) = prefix.split("#", limit = 2)
+                PlayerEntry(lang, server, playerUrl)
+            } else {
+                PlayerEntry(null, prefix, playerUrl)
+            }
+        }
+
+        // Si l'épisode a des langues taggées, utilise la langue préférée
+        // en priorité, sinon fallback sur l'autre langue disponible
+        val hasLangTag = allEntries.any { it.lang != null }
+        val selectedEntries = if (hasLangTag) {
+            val preferred = allEntries.filter { it.lang == prefLang }
+            if (preferred.isNotEmpty()) {
+                Log.d(TAG, "getVideoList: using preferred lang=$prefLang (${preferred.size} players)")
+                preferred
+            } else {
+                val fallback = allEntries.filter { it.lang != null }
+                Log.d(TAG, "getVideoList: $prefLang unavailable, fallback (${fallback.size} players)")
+                fallback
+            }
+        } else {
+            allEntries
+        }
+
+        Log.d(TAG, "getVideoList: ${selectedEntries.size} players total")
 
         val videos = mutableListOf<Video>()
 
-        playerEntries.forEach { entry ->
-            val (server, playerUrl) = entry.split("::", limit = 2)
-            Log.d(TAG, "getVideoList: server=$server, url=$playerUrl")
+        selectedEntries.forEach { entry ->
+            val server = entry.server
+            val playerUrl = entry.url
+            Log.d(TAG, "getVideoList: lang=${entry.lang}, server=$server, url=$playerUrl")
 
             try {
                 val extracted = when {
