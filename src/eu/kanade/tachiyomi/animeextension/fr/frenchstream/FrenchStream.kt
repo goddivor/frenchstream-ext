@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.animeextension.fr.frenchstream
 
 import android.app.Application
 import android.content.SharedPreferences
-import android.util.Log
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
@@ -57,15 +56,29 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     override fun popularAnimeSelector(): String = "div.short"
 
     override fun popularAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
-        val link = element.selectFirst("a.short-poster[href]")
-        if (link != null) {
-            setUrlWithoutDomain(link.attr("href"))
-            title = link.attr("alt").ifBlank { link.attr("title") }.trim()
-        }
+        val link = element.selectFirst("a.short-poster[href]") ?: element.selectFirst("a[href]")
+        // Always init `url` to avoid UninitializedPropertyAccessException downstream
+        // (Anikku's "related mangas" feature crashes hard when any SAnime has no url).
+        url = link?.attr("href")?.takeIf { it.isNotBlank() }
+            ?.let { it.substringAfter("//").substringAfter("/").let { p -> "/$p" } }
+            ?: "/"
+        title = link?.let { it.attr("alt").ifBlank { it.attr("title") }.trim() }
+            ?: element.selectFirst("img")?.attr("alt").orEmpty()
         thumbnail_url = element.selectFirst("img")?.absUrl("src")
     }
 
     override fun popularAnimeNextPageSelector(): String = "a[href*='page/']"
+
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val document = response.asJsoup()
+        val animes = document.select(popularAnimeSelector())
+            .map(::popularAnimeFromElement)
+            .filter { it.url.length > 1 && it.title.isNotBlank() }
+        val hasNext = document.selectFirst(popularAnimeNextPageSelector()) != null
+        return AnimesPage(animes, hasNext)
+    }
+
+    override fun latestUpdatesParse(response: Response): AnimesPage = popularAnimeParse(response)
 
     // =============================== Latest ===============================
 
@@ -95,8 +108,14 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun searchAnimeFromElement(element: Element): SAnime = SAnime.create().apply {
         val onclick = element.attr("onclick")
-        val href = Regex("location\\.href='([^']+)'").find(onclick)?.groupValues?.get(1).orEmpty()
-        if (href.isNotEmpty()) setUrlWithoutDomain(href)
+        val href = Regex("location\\.href=['\"]([^'\"]+)['\"]").find(onclick)?.groupValues?.get(1)
+            ?: element.selectFirst("a[href]")?.attr("href")
+            ?: ""
+        // Always init `url` even if extraction fails - Anikku's related-mangas feature
+        // crashes with UninitializedPropertyAccessException otherwise.
+        url = href.takeIf { it.isNotBlank() }
+            ?.let { it.substringAfter("//").substringAfter("/").let { p -> "/$p" } }
+            ?: "/"
         title = element.selectFirst("div.search-title")?.text()?.trim()
             ?: element.selectFirst("img")?.attr("alt").orEmpty()
         thumbnail_url = element.selectFirst("img")?.absUrl("src")
@@ -106,8 +125,10 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val document = response.asJsoup()
-        val animes = document.select(searchAnimeSelector()).map(::searchAnimeFromElement)
-        // L'endpoint AJAX renvoie tous les résultats sur une seule page
+        // Skip entries that didn't get a real URL — they would crash the related-mangas feature.
+        val animes = document.select(searchAnimeSelector())
+            .map(::searchAnimeFromElement)
+            .filter { it.url.length > 1 && it.title.isNotBlank() }
         return AnimesPage(animes, false)
     }
 
@@ -118,13 +139,28 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     // =========================== Anime Details ============================
 
     override fun animeDetailsParse(document: Document): SAnime = SAnime.create().apply {
-        setUrlWithoutDomain(document.location())
+        // setUrlWithoutDomain may silently fail when document.location() is empty.
+        // Always init url with a sane fallback so Aniyomi doesn't crash with
+        // UninitializedPropertyAccessException on lateinit url.
+        url = document.location().substringAfter("//").substringAfter("/").let { "/$it" }
+            .takeIf { it.length > 1 } ?: "/"
         title = document.selectFirst("h1")?.text()?.trim() ?: ""
         thumbnail_url = document.selectFirst("div.fimg img, .short-poster img")?.absUrl("src")
         description = document.selectFirst("span[id^='desc-']")?.text()
             ?: document.selectFirst(".fdesc")?.text()
         genre = document.select("span.fgenre a, .flist a[href*='genre']").joinToString { it.text() }
         status = SAnime.UNKNOWN
+    }
+
+    // Override getAnimeDetails so we can propagate the original url from the SAnime
+    // we received in case animeDetailsParse can't recover it from the document.
+    override suspend fun getAnimeDetails(anime: SAnime): SAnime {
+        val response = client.newCall(animeDetailsRequest(anime)).execute()
+        val parsed = animeDetailsParse(response.asJsoup())
+        // If the parsed url is the placeholder "/", reuse the original anime.url
+        if (parsed.url.length <= 1) parsed.url = anime.url
+        parsed.initialized = true
+        return parsed
     }
 
     // ============================== Episodes ==============================
@@ -135,22 +171,31 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
 
     override fun episodeListParse(response: Response): List<SEpisode> {
         val document = response.asJsoup()
-        val url = response.request.url.toString()
+        val pageUrl = response.request.url
+        val url = pageUrl.toString()
 
-        // Extract ID from URL: /15122868-slug.html -> 15122868
-        val id = url.substringAfterLast("/").substringBefore("-")
-        Log.d(TAG, "episodeListParse: id=$id, url=$url")
+        // Site now uses query strings (?newsid=ID) — try those first, fall back to
+        // the old `/ID-slug.html` pattern, and finally to any digits we find on the page.
+        val newsId = pageUrl.queryParameter("newsid")
+        val pathId = url.substringAfterLast("/").substringBefore("-").takeIf { it.all(Char::isDigit) }
+        val pageId = document.selectFirst("[data-id]")?.attr("data-id")?.takeIf { it.isNotEmpty() }
+            ?: Regex("""ep-data\.php\?id=(\d+)""").find(document.html())?.groupValues?.get(1)
+            ?: Regex("""dle_id\s*=\s*['"]?(\d+)""").find(document.html())?.groupValues?.get(1)
+        val effectiveId = newsId ?: pageId ?: pathId.orEmpty()
 
-        // Call episode API
-        val epResponse = client.newCall(GET("$baseUrl/ep-data.php?id=$id", headers)).execute()
+        // Use the host of the page URL itself in case the user landed on a mirror
+        // domain (e.g. fs03.lol while baseUrl pref says fs18.lol).
+        val pageHost = "${pageUrl.scheme}://${pageUrl.host}"
+        val epUrl = "$pageHost/ep-data.php?id=$effectiveId"
+        val epResponse = client.newCall(GET(epUrl, headers)).execute()
         val epBody = epResponse.body.string()
 
-        val epData = json.decodeFromString<JsonObject>(epBody)
+        val epData = runCatching { json.decodeFromString<JsonObject>(epBody) }
+            .getOrElse { JsonObject(emptyMap()) }
 
         // Check if it's a film (has "players" key) vs series (has "vf"/"vostfr" keys)
         if (epData.containsKey("players")) {
-            Log.d(TAG, "episodeListParse: detected FILM format")
-            return parseFilmEpisodes(epData, id)
+            return parseFilmEpisodes(epData, effectiveId)
         }
 
         val vfData = epData["vf"]?.jsonObject
@@ -160,16 +205,16 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
             (vfData?.isEmpty() != false && vostfrData?.isEmpty() != false)
         ) {
             // Try film API as fallback
-            Log.d(TAG, "episodeListParse: ep-data empty, trying film_api")
-            val filmResponse = client.newCall(GET("$baseUrl/engine/ajax/film_api.php?id=$id", headers)).execute()
+            val filmUrl = "$pageHost/engine/ajax/film_api.php?id=$effectiveId"
+            val filmResponse = client.newCall(GET(filmUrl, headers)).execute()
             val filmBody = filmResponse.body.string()
             if (filmBody.isNotBlank() && filmBody != "{}") {
-                val filmData = json.decodeFromString<JsonObject>(filmBody)
+                val filmData = runCatching { json.decodeFromString<JsonObject>(filmBody) }
+                    .getOrElse { JsonObject(emptyMap()) }
                 if (filmData.containsKey("players")) {
-                    return parseFilmEpisodes(filmData, id)
+                    return parseFilmEpisodes(filmData, effectiveId)
                 }
             }
-            Log.w(TAG, "episodeListParse: no data found")
             return emptyList()
         }
 
@@ -180,10 +225,7 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
             .distinct()
             .sortedBy { it.toIntOrNull() ?: 0 }
 
-        if (allEpNums.isEmpty()) {
-            Log.w(TAG, "episodeListParse: no episodes found in API")
-            return emptyList()
-        }
+        if (allEpNums.isEmpty()) return emptyList()
 
         val episodes = allEpNums.map { epNum ->
             val epInfo = infoData?.get(epNum)?.jsonObject
@@ -220,7 +262,6 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
             }
         }
 
-        Log.d(TAG, "episodeListParse: ${episodes.size} episodes found")
         return episodes.sortedByDescending { it.episode_number }
     }
 
@@ -234,8 +275,6 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
                 ?: varObj.values.firstOrNull()?.jsonPrimitive?.content
             if (url != null) "$server::$url" else null
         }.joinToString(";;;")
-
-        Log.d(TAG, "parseFilmEpisodes: ${players.size} players")
 
         return listOf(
             SEpisode.create().apply {
@@ -277,26 +316,16 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
         val hasLangTag = allEntries.any { it.lang != null }
         val selectedEntries = if (hasLangTag) {
             val preferred = allEntries.filter { it.lang == prefLang }
-            if (preferred.isNotEmpty()) {
-                Log.d(TAG, "getVideoList: using preferred lang=$prefLang (${preferred.size} players)")
-                preferred
-            } else {
-                val fallback = allEntries.filter { it.lang != null }
-                Log.d(TAG, "getVideoList: $prefLang unavailable, fallback (${fallback.size} players)")
-                fallback
-            }
+            preferred.ifEmpty { allEntries.filter { it.lang != null } }
         } else {
             allEntries
         }
-
-        Log.d(TAG, "getVideoList: ${selectedEntries.size} players total")
 
         val videos = mutableListOf<Video>()
 
         selectedEntries.forEach { entry ->
             val server = entry.server
             val playerUrl = entry.url
-            Log.d(TAG, "getVideoList: lang=${entry.lang}, server=$server, url=$playerUrl")
 
             try {
                 val extracted = when {
@@ -314,19 +343,13 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
                         vidHideExtractor.videosFromUrl(playerUrl) { "Premium - $it" }
                     server == "dood" || playerUrl.contains("dood") || playerUrl.contains("tokyo") ->
                         voeExtractor.videosFromUrl(playerUrl)
-                    else -> {
-                        Log.w(TAG, "getVideoList: unknown server=$server")
-                        emptyList()
-                    }
+                    else -> emptyList()
                 }
-                Log.d(TAG, "getVideoList: $server extracted ${extracted.size} videos")
                 videos.addAll(extracted)
-            } catch (e: Exception) {
-                Log.e(TAG, "getVideoList: error for $server: ${e.message}")
+            } catch (_: Exception) {
             }
         }
 
-        Log.d(TAG, "getVideoList: total=${videos.size}")
         return videos
     }
 
@@ -379,7 +402,7 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
             title = "URL du site"
             summary = "URL actuelle : ${preferences.getString(PREF_BASE_URL_KEY, DEFAULT_BASE_URL)}"
             dialogTitle = "Modifier l'URL du site"
-            dialogMessage = "Entrez la nouvelle URL (ex: https://fs18.lol)"
+            dialogMessage = "Entrez la nouvelle URL (ex: https://fs03.lol)"
             setDefaultValue(DEFAULT_BASE_URL)
 
             setOnPreferenceChangeListener { _, newValue ->
@@ -390,9 +413,8 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     }
 
     companion object {
-        private const val TAG = "FrenchStream"
         private const val PREF_BASE_URL_KEY = "base_url"
-        private const val DEFAULT_BASE_URL = "https://fs18.lol"
+        private const val DEFAULT_BASE_URL = "https://fs03.lol"
         private const val PREF_LANG_KEY = "preferred_lang"
         private const val PREF_LANG_DEFAULT = "vf"
 
