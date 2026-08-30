@@ -290,7 +290,19 @@ class FrenchStream : ParsedAnimeHttpSource(), ConfigurableAnimeSource {
     private val uqloadExtractor by lazy { UqloadExtractor(client) }
     private val voeExtractor by lazy { VoeExtractor(client, headers) }
     private val filemoonExtractor by lazy { FilemoonExtractor(client) }
-    private val vidHideExtractor by lazy { VidHideExtractor(client, headers) }
+
+    // fsvid (serveur « Premium ») est hotlink-protégé : sa page embed n'est
+    // servie qu'avec le Referer du site FrenchStream et le cookie anti-bot.
+    // Vidzy (public) accepte ces mêmes en-têtes sans souci.
+    private val vidHideExtractor by lazy {
+        VidHideExtractor(
+            client,
+            headers.newBuilder()
+                .set("Referer", "$baseUrl/")
+                .set("Cookie", "fsschal=1")
+                .build(),
+        )
+    }
 
     override fun videoListParse(response: Response): List<Video> = throw UnsupportedOperationException()
 
